@@ -28,7 +28,9 @@ using Real = Real64;
 using Int = Int64;
 using LInt = Int;
 using BReal = Real64;
-using PD_T = PlanarDiagram<Int>;
+using PD_T = PlanarDiagram2<Int>;        // New diagram type
+using PDC_T = PlanarDiagramComplex<Int>; // New diagram complex type
+using OldPD_T = PlanarDiagram<Int>;      // Legacy type, needed for Alexander bridge
 using Complex = Complex64;
 
 // Define Alexander polynomial calculator type (only if UMFPACK available)
@@ -51,34 +53,41 @@ double AlexanderResult::to_double() const {
     return mantissa * std::pow(10.0, exponent);
 }
 
-// Implementation class that holds the planar diagram
+// Implementation class that holds the planar diagram complex
 class KnotAnalyzerImpl {
 public:
-    std::unique_ptr<PD_T> pd;
+    PDC_T pdc;                // The diagram complex (replaces old unique_ptr<PD_T>)
+    Int primary_diagram_idx;  // Index of the primary (first non-unknot) diagram, -1 if none
+
 #ifdef USE_UMFPACK
     mutable std::unique_ptr<Alexander_T> alexander_calc;
 #endif
 
-#ifdef USE_UMFPACK
-    KnotAnalyzerImpl() : pd(nullptr), alexander_calc(nullptr) {}
-#else
-    KnotAnalyzerImpl() : pd(nullptr) {}
-#endif
+    KnotAnalyzerImpl() : primary_diagram_idx(-1) {}
 
-    KnotAnalyzerImpl(const KnotAnalyzerImpl& other) {
-        if (other.pd) {
-            pd = std::make_unique<PD_T>(*other.pd);
-        }
+    KnotAnalyzerImpl(const KnotAnalyzerImpl& other)
+        : pdc(other.pdc), primary_diagram_idx(other.primary_diagram_idx) {
         // Don't copy alexander_calc - it will be created on-demand
     }
 
 #ifdef USE_UMFPACK
     KnotAnalyzerImpl(KnotAnalyzerImpl&& other) noexcept
-        : pd(std::move(other.pd)), alexander_calc(std::move(other.alexander_calc)) {}
+        : pdc(std::move(other.pdc)),
+          primary_diagram_idx(other.primary_diagram_idx),
+          alexander_calc(std::move(other.alexander_calc)) {}
 #else
     KnotAnalyzerImpl(KnotAnalyzerImpl&& other) noexcept
-        : pd(std::move(other.pd)) {}
+        : pdc(std::move(other.pdc)),
+          primary_diagram_idx(other.primary_diagram_idx) {}
 #endif
+
+    // Get the primary diagram (first non-unknot with crossings)
+    const PD_T* get_primary_diagram() const {
+        if (primary_diagram_idx >= 0 && primary_diagram_idx < pdc.DiagramCount()) {
+            return &pdc.Diagram(primary_diagram_idx);
+        }
+        return nullptr;
+    }
 
 #ifdef USE_UMFPACK
     // Get or create Alexander calculator
@@ -95,7 +104,7 @@ public:
 double calculate_squared_gyradius(const std::vector<double>& coords) {
     int n_points = coords.size() / 3;
     if (n_points == 0) return 0.0;
-    
+
     // Calculate center of mass
     double x_sum = 0.0, y_sum = 0.0, z_sum = 0.0;
     for (int i = 0; i < n_points; ++i) {
@@ -106,7 +115,7 @@ double calculate_squared_gyradius(const std::vector<double>& coords) {
     double x_avg = x_sum / n_points;
     double y_avg = y_sum / n_points;
     double z_avg = z_sum / n_points;
-    
+
     // Calculate average squared distance from center
     double sum_sq_dist = 0.0;
     for (int i = 0; i < n_points; ++i) {
@@ -115,15 +124,15 @@ double calculate_squared_gyradius(const std::vector<double>& coords) {
         double dz = coords[3*i+2] - z_avg;
         sum_sq_dist += dx*dx + dy*dy + dz*dz;
     }
-    
+
     return sum_sq_dist / n_points;
 }
 
-// Convert PD_T to PD code string
-std::string pd_to_string(PD_T& pd) {
+// Convert PD_T (PlanarDiagram2) to PD code string (5 entries: 4 arcs + handedness)
+std::string pd_to_string(const PD_T& pd) {
     std::stringstream ss;
     auto pdcode = pd.PDCode();
-    
+
     for (Int i = 0; i < pdcode.Dimension(0); ++i) {
         ss << "[";
         for (Int j = 0; j < 5; ++j) {  // Include all 5 entries (4 arcs + handedness)
@@ -133,15 +142,15 @@ std::string pd_to_string(PD_T& pd) {
         ss << "]";
         if (i < pdcode.Dimension(0) - 1) ss << ",";
     }
-    
+
     return ss.str();
 }
 
 // Convert PD_T to unsigned PD code string (4 entries only, for backward compatibility)
-std::string pd_to_string_unsigned(PD_T& pd) {
+std::string pd_to_string_unsigned(const PD_T& pd) {
     std::stringstream ss;
     auto pdcode = pd.PDCode();
-    
+
     for (Int i = 0; i < pdcode.Dimension(0); ++i) {
         ss << "[";
         for (Int j = 0; j < 4; ++j) {  // Only first 4 entries (arcs only)
@@ -151,35 +160,104 @@ std::string pd_to_string_unsigned(PD_T& pd) {
         ss << "]";
         if (i < pdcode.Dimension(0) - 1) ss << ",";
     }
-    
+
     return ss.str();
 }
 
 // Convert PD_T to Gauss code string
-std::string gauss_to_string(PD_T& pd) {
-    std::stringstream ss;
-    
-    // Get the extended Gauss code (one entry per arc)
-    auto extgausscode = pd.ExtendedGaussCode();
-    Int code_size = extgausscode.Size();
-    
-    if (code_size == 0) {
+std::string gauss_to_string(const PD_T& pd) {
+    try {
+        auto extgausscode = pd.ExtendedGaussCode();
+        Int code_size = extgausscode.Size();
+
+        if (code_size == 0) {
+            return "";
+        }
+
+        std::stringstream ss;
+        ss << "ext:";
+        for (Int i = 0; i < code_size; ++i) {
+            ss << extgausscode[i];
+            if (i < code_size - 1) ss << " ";
+        }
+
+        return ss.str();
+    } catch (...) {
         return "";
     }
-    
-    // The ExtendedGaussCode has one entry per arc (not per crossing)
-    // For a knot with n crossings, there are 2n arcs
-    // Each crossing is visited twice during the traversal
-    
-    // For now, return the extended code but mark it as such
-    // A proper standard Gauss code would require different logic
-    ss << "ext:";
-    for (Int i = 0; i < code_size; ++i) {
-        ss << extgausscode[i];
-        if (i < code_size - 1) ss << " ";
+}
+
+// Map old simplify levels to new Simplify_Args_T
+PDC_T::Simplify_Args_T make_simplify_args(int simplify_level) {
+    PDC_T::Simplify_Args_T args;
+    switch (simplify_level) {
+        case 1:
+        case 2:
+        case 3:
+            // Strand simplification only - no disconnect, split, or reapr
+            args.disconnectQ = false;
+            args.splitQ = false;
+            args.reapr_embedding_trials = 0;
+            args.reapr_rotation_trials = 0;
+            break;
+        case 4:
+            // Add disconnect and split, but no reapr
+            args.disconnectQ = true;
+            args.splitQ = true;
+            args.reapr_embedding_trials = 0;
+            args.reapr_rotation_trials = 0;
+            break;
+        case 5:
+        default:
+            // Full simplification with all defaults (including reapr)
+            break;
     }
-    
-    return ss.str();
+    return args;
+}
+
+// Analyze a PDC_T to extract summary properties
+struct PDCAnalysis {
+    Int total_crossing_count;
+    Int total_writhe;
+    Int unlink_count;
+    Int nontrivial_count;
+    Int first_nontrivial_idx;
+
+    static PDCAnalysis analyze(const PDC_T& pdc) {
+        PDCAnalysis result = {};
+        result.total_crossing_count = 0;
+        result.total_writhe = 0;
+        result.unlink_count = 0;
+        result.nontrivial_count = 0;
+        result.first_nontrivial_idx = -1;
+
+        for (Int i = 0; i < pdc.DiagramCount(); ++i) {
+            const PD_T& pd = pdc.Diagram(i);
+            if (pd.ProvenUnknotQ()) {
+                result.unlink_count++;
+            } else if (pd.CrossingCount() > 0) {
+                result.total_crossing_count += pd.CrossingCount();
+                result.total_writhe += pd.Writhe();
+                result.nontrivial_count++;
+                if (result.first_nontrivial_idx < 0) {
+                    result.first_nontrivial_idx = i;
+                }
+            }
+        }
+
+        return result;
+    }
+};
+
+// Bridge: construct an old PlanarDiagram from a new PlanarDiagram2's PD code
+// Needed because Alexander_UMFPACK still uses PlanarDiagram<Int>
+OldPD_T bridge_to_old_pd(const PD_T& pd2) {
+    auto pdcode = pd2.PDCode();
+    Int n = pd2.CrossingCount();
+    if (n == 0) {
+        return OldPD_T();
+    }
+    return OldPD_T::FromSignedPDCode(pdcode.data(), n, Int(0), true, false);
 }
 
 // KnotAnalyzer implementation
@@ -194,88 +272,84 @@ KnotAnalyzer::KnotAnalyzer() : impl(std::make_shared<KnotAnalyzerImpl>()) {
     prime_component_count = 0;
 }
 
-KnotAnalyzer::KnotAnalyzer(const std::vector<double>& coordinates, bool simplify, int simplify_level) 
+KnotAnalyzer::KnotAnalyzer(const std::vector<double>& coordinates, bool simplify, int simplify_level)
     : impl(std::make_shared<KnotAnalyzerImpl>()) {
-    
+
     try {
         Int n = coordinates.size() / 3;
-        
-        // Create planar diagram from coordinates
-        impl->pd = std::make_unique<PD_T>(coordinates.data(), n);
-        
+
+        // Create planar diagram complex from coordinates
+        impl->pdc = PDC_T::FromKnotEmbedding(coordinates.data(), n);
+
         // Apply simplification if requested
-        if (simplify && impl->pd) {
-            std::vector<PD_T> comps;
-            switch (simplify_level) {
-                case 1:
-                    impl->pd->Simplify1();
-                    break;
-                case 2:
-                    impl->pd->Simplify2();
-                    break;
-                case 3:
-                    impl->pd->Simplify3(4);
-                    break;
-                case 4:
-                    impl->pd->Simplify4();
-                    break;
-                case 5:
-                default:
-                    impl->pd->Simplify5(comps);
-                    
-                    // Process prime components that were split off
-                    for (PD_T& comp : comps) {
-                        KnotAnalyzer comp_analyzer;
-                        comp_analyzer.crossing_count = comp.CrossingCount();
-                        comp_analyzer.writhe = comp.Writhe();
-                        comp_analyzer.pd_code = pd_to_string(comp);
-                        comp_analyzer.gauss_code = gauss_to_string(comp);
-                        comp_analyzer.squared_gyradius = 0.0; // Components don't have coordinates
-                        comp_analyzer.link_component_count = comp.LinkComponentCount();
-                        comp_analyzer.unlink_count = comp.UnlinkCount();
-                        comp_analyzer.is_prime = true; // Components from DisconnectSummands are prime
-                        comp_analyzer.is_composite = false;
-                        comp_analyzer.prime_component_count = 1;
-                        
-                        prime_components.push_back(std::move(comp_analyzer));
-                    }
-                    break;
-            }
+        if (simplify) {
+            auto args = make_simplify_args(simplify_level);
+            impl->pdc.Simplify(args);
         }
-        
-        // Extract properties once
-        if (impl->pd) {
-            crossing_count = impl->pd->CrossingCount();
-            writhe = impl->pd->Writhe();
-            pd_code = pd_to_string(*impl->pd);
-            gauss_code = gauss_to_string(*impl->pd);
-            squared_gyradius = calculate_squared_gyradius(coordinates);
-            
-            // Get the true link component count and unlink count
-            link_component_count = impl->pd->LinkComponentCount();
-            unlink_count = impl->pd->UnlinkCount();
-            
-            // Determine if knot is prime or composite
-            if (prime_components.empty()) {
-                // No components were split off
-                is_prime = true;
-                is_composite = false;
-                prime_component_count = (crossing_count > 0) ? 1 : 0; // 1 if non-trivial, 0 if unknot
-            } else {
-                // Components were split off - this is a composite knot
-                is_composite = true;
-                is_prime = false;
-                
-                // Total prime components = split-off components + remainder (if non-trivial)
-                prime_component_count = prime_components.size();
-                if (crossing_count > 0) {
-                    // The remainder after splitting is also a prime component
-                    prime_component_count++;
-                }
-            }
+
+        // Analyze the complex
+        auto analysis = PDCAnalysis::analyze(impl->pdc);
+        impl->primary_diagram_idx = analysis.first_nontrivial_idx;
+
+        // Extract properties
+        crossing_count = analysis.total_crossing_count;
+        writhe = analysis.total_writhe;
+        unlink_count = analysis.unlink_count;
+        squared_gyradius = calculate_squared_gyradius(coordinates);
+
+        // PD code and gauss code from the primary diagram
+        const PD_T* primary = impl->get_primary_diagram();
+        if (primary) {
+            pd_code = pd_to_string(*primary);
+            gauss_code = gauss_to_string(*primary);
+            link_component_count = primary->LinkComponentCount();
         } else {
-            throw std::runtime_error("Failed to create planar diagram");
+            pd_code = "";
+            gauss_code = "";
+            link_component_count = 1;  // unknot has 1 link component
         }
+
+        // Prime decomposition: every non-unknot diagram is a prime component
+        if (analysis.nontrivial_count > 1) {
+            is_composite = true;
+            is_prime = false;
+            prime_component_count = analysis.nontrivial_count;
+
+            for (Int i = 0; i < impl->pdc.DiagramCount(); ++i) {
+                const PD_T& comp_pd = impl->pdc.Diagram(i);
+                if (comp_pd.ProvenUnknotQ() || comp_pd.CrossingCount() == 0) continue;
+
+                KnotAnalyzer comp;
+                comp.crossing_count = comp_pd.CrossingCount();
+                comp.writhe = comp_pd.Writhe();
+                comp.pd_code = pd_to_string(comp_pd);
+                comp.gauss_code = gauss_to_string(comp_pd);
+                comp.squared_gyradius = 0.0;
+                comp.link_component_count = comp_pd.LinkComponentCount();
+                comp.unlink_count = 0;
+                comp.is_prime = true;
+                comp.is_composite = false;
+                comp.prime_component_count = 1;
+
+                // Create a PDC_T for this child from a copy of the component diagram
+                comp.impl = std::make_shared<KnotAnalyzerImpl>();
+                PD_T comp_copy = comp_pd;
+                comp.impl->pdc = PDC_T(std::move(comp_copy));
+                comp.impl->primary_diagram_idx = 0;
+
+                prime_components.push_back(std::move(comp));
+            }
+        } else if (analysis.nontrivial_count == 1) {
+            is_prime = true;
+            is_composite = false;
+            prime_component_count = 1;
+        } else {
+            // Unknot
+            is_prime = true;
+            is_composite = false;
+            prime_component_count = 0;
+        }
+
     } catch (const std::exception& e) {
         std::cerr << "Error in KnotAnalyzer constructor: " << e.what() << std::endl;
         // Set error values
@@ -293,7 +367,7 @@ KnotAnalyzer::KnotAnalyzer(const std::vector<double>& coordinates, bool simplify
 }
 
 // Copy constructor
-KnotAnalyzer::KnotAnalyzer(const KnotAnalyzer& other) 
+KnotAnalyzer::KnotAnalyzer(const KnotAnalyzer& other)
     : impl(std::make_shared<KnotAnalyzerImpl>(*other.impl)),
       crossing_count(other.crossing_count),
       writhe(other.writhe),
@@ -367,20 +441,22 @@ KnotAnalyzer::~KnotAnalyzer() = default;
 
 // Helper methods for PD code analysis
 std::string KnotAnalyzer::get_pd_code_unsigned() const {
-    if (!impl->pd) return "";
-    return pd_to_string_unsigned(*impl->pd);
+    const PD_T* primary = impl->get_primary_diagram();
+    if (!primary) return "";
+    return pd_to_string_unsigned(*primary);
 }
 
 std::vector<std::vector<int>> KnotAnalyzer::get_pd_code_matrix() const {
     std::vector<std::vector<int>> result;
-    
-    if (!impl->pd) return result;
-    
-    auto pdcode = impl->pd->PDCode();
+
+    const PD_T* primary = impl->get_primary_diagram();
+    if (!primary) return result;
+
+    auto pdcode = primary->PDCode();
     int num_crossings = pdcode.Dimension(0);
-    
+
     result.reserve(num_crossings);
-    
+
     for (int i = 0; i < num_crossings; ++i) {
         std::vector<int> crossing(5);  // 4 arcs + handedness
         for (int j = 0; j < 5; ++j) {
@@ -388,24 +464,25 @@ std::vector<std::vector<int>> KnotAnalyzer::get_pd_code_matrix() const {
         }
         result.push_back(crossing);
     }
-    
+
     return result;
 }
 
 std::vector<int> KnotAnalyzer::get_crossing_handedness() const {
     std::vector<int> handedness;
-    
-    if (!impl->pd) return handedness;
-    
-    auto pdcode = impl->pd->PDCode();
+
+    const PD_T* primary = impl->get_primary_diagram();
+    if (!primary) return handedness;
+
+    auto pdcode = primary->PDCode();
     int num_crossings = pdcode.Dimension(0);
-    
+
     handedness.reserve(num_crossings);
-    
+
     for (int i = 0; i < num_crossings; ++i) {
         handedness.push_back(static_cast<int>(pdcode(i, 4)));  // 5th entry is handedness
     }
-    
+
     return handedness;
 }
 
@@ -414,20 +491,26 @@ std::vector<int> KnotAnalyzer::get_crossing_handedness() const {
 AlexanderResult KnotAnalyzer::alexander(const std::complex<double>& z) const {
     AlexanderResult result;
 
-    if (!impl->pd || impl->pd->CrossingCount() == 0) {
+    const PD_T* primary = impl->get_primary_diagram();
+    if (!primary || primary->CrossingCount() == 0) {
         result.mantissa = 1.0;
         result.exponent = 0;
         return result;
     }
 
     try {
+        // Bridge to old PlanarDiagram for Alexander computation
+        OldPD_T old_pd = bridge_to_old_pd(*primary);
+
         Alexander_T& alex_calc = impl->get_alexander_calculator();
 
         Complex arg = Complex(z.real(), z.imag());
         Complex mantissa;
         Int exponent;
 
-        alex_calc.Alexander(*impl->pd, arg, mantissa, exponent, false);
+        // Use batch API (single element) because the single-value Alexander()
+        // takes mantissa/exponent by value, so results are never written back.
+        alex_calc.Alexander(old_pd, &arg, Int(1), &mantissa, &exponent, false);
 
         // Convert complex result to real (Alexander polynomial should be real for real inputs)
         result.mantissa = std::real(mantissa);
@@ -450,7 +533,8 @@ std::vector<AlexanderResult> KnotAnalyzer::alexander(const std::vector<std::comp
     std::vector<AlexanderResult> results;
     results.reserve(points.size());
 
-    if (!impl->pd || impl->pd->CrossingCount() == 0) {
+    const PD_T* primary = impl->get_primary_diagram();
+    if (!primary || primary->CrossingCount() == 0) {
         // Unknot case
         for (size_t i = 0; i < points.size(); ++i) {
             results.push_back({1.0, 0});
@@ -459,6 +543,9 @@ std::vector<AlexanderResult> KnotAnalyzer::alexander(const std::vector<std::comp
     }
 
     try {
+        // Bridge to old PlanarDiagram for Alexander computation
+        OldPD_T old_pd = bridge_to_old_pd(*primary);
+
         Alexander_T& alex_calc = impl->get_alexander_calculator();
 
         // Convert input points to Complex
@@ -473,7 +560,7 @@ std::vector<AlexanderResult> KnotAnalyzer::alexander(const std::vector<std::comp
         std::vector<Int> exponents(points.size());
 
         // Compute Alexander polynomial for all points
-        alex_calc.Alexander(*impl->pd, args.data(), static_cast<Int>(args.size()),
+        alex_calc.Alexander(old_pd, args.data(), static_cast<Int>(args.size()),
                            mantissas.data(), exponents.data(), false);
 
         // Convert results
@@ -587,17 +674,18 @@ AlexanderResult alexander(const std::vector<double>& coordinates, const std::com
 std::vector<uint8_t> KnotAnalyzer::macleod_code() const {
     std::vector<uint8_t> result;
 
-    if (!impl->pd || impl->pd->CrossingCount() == 0) {
+    const PD_T* primary = impl->get_primary_diagram();
+    if (!primary || primary->CrossingCount() == 0) {
         return result;  // Empty for unknot
     }
 
-    if (impl->pd->LinkComponentCount() > 1) {
+    if (primary->LinkComponentCount() > 1) {
         std::cerr << "MacLeod code not defined for links with multiple components" << std::endl;
         return result;
     }
 
     try {
-        auto code = impl->pd->template MacLeodCode<UInt8>();
+        auto code = primary->template MacLeodCode<UInt8>();
         result.reserve(code.Size());
         for (Int i = 0; i < code.Size(); ++i) {
             result.push_back(code[i]);
@@ -610,16 +698,17 @@ std::vector<uint8_t> KnotAnalyzer::macleod_code() const {
 }
 
 std::string KnotAnalyzer::macleod_string() const {
-    if (!impl->pd || impl->pd->CrossingCount() == 0) {
+    const PD_T* primary = impl->get_primary_diagram();
+    if (!primary || primary->CrossingCount() == 0) {
         return "";
     }
 
-    if (impl->pd->LinkComponentCount() > 1) {
+    if (primary->LinkComponentCount() > 1) {
         return "";
     }
 
     try {
-        return impl->pd->MacLeodString();
+        return primary->MacLeodString();
     } catch (const std::exception& e) {
         std::cerr << "Error computing MacLeod string: " << e.what() << std::endl;
         return "";
@@ -627,8 +716,9 @@ std::string KnotAnalyzer::macleod_string() const {
 }
 
 bool KnotAnalyzer::proven_minimal() const {
-    if (!impl->pd) return false;
-    return impl->pd->ProvenMinimalQ();
+    const PD_T* primary = impl->get_primary_diagram();
+    if (!primary) return false;
+    return primary->ProvenMinimalQ();
 }
 
 // Factory method to create from PD code
@@ -667,89 +757,83 @@ KnotAnalyzer KnotAnalyzer::from_pd_code(const std::vector<std::vector<int>>& pd_
             }
         }
 
-        // Create PlanarDiagram from PD code
-        std::unique_ptr<PD_T> pd;
+        // Create PlanarDiagramComplex from PD code
+        result.impl = std::make_shared<KnotAnalyzerImpl>();
         if (signed_pd) {
-            pd = std::make_unique<PD_T>(
-                PD_T::FromSignedPDCode(flat_pd.data(), n, Int(0), true, false)
-            );
+            result.impl->pdc = PDC_T::FromPDCode<true>(flat_pd.data(), n, false, false);
         } else {
-            pd = std::make_unique<PD_T>(
-                PD_T::FromUnsignedPDCode(flat_pd.data(), n, Int(0), true, false)
-            );
+            result.impl->pdc = PDC_T::FromPDCode<false>(flat_pd.data(), n, false, false);
         }
 
-        if (!pd->ValidQ()) {
+        // Validate
+        if (result.impl->pdc.DiagramCount() == 0 ||
+            result.impl->pdc.Diagram(0).InvalidQ()) {
             throw std::runtime_error("Invalid PD code - could not create valid diagram");
         }
 
-        result.impl = std::make_shared<KnotAnalyzerImpl>();
-        result.impl->pd = std::move(pd);
-
         // Apply simplification if requested
-        if (simplify && result.impl->pd) {
-            std::vector<PD_T> comps;
-            switch (simplify_level) {
-                case 1:
-                    result.impl->pd->Simplify1();
-                    break;
-                case 2:
-                    result.impl->pd->Simplify2();
-                    break;
-                case 3:
-                    result.impl->pd->Simplify3(4);
-                    break;
-                case 4:
-                    result.impl->pd->Simplify4();
-                    break;
-                case 5:
-                default:
-                    result.impl->pd->Simplify5(comps);
-
-                    // Process prime components that were split off
-                    for (PD_T& comp : comps) {
-                        KnotAnalyzer comp_analyzer;
-                        comp_analyzer.impl = std::make_shared<KnotAnalyzerImpl>();
-                        comp_analyzer.impl->pd = std::make_unique<PD_T>(std::move(comp));
-                        comp_analyzer.crossing_count = comp_analyzer.impl->pd->CrossingCount();
-                        comp_analyzer.writhe = comp_analyzer.impl->pd->Writhe();
-                        comp_analyzer.pd_code = pd_to_string(*comp_analyzer.impl->pd);
-                        comp_analyzer.gauss_code = gauss_to_string(*comp_analyzer.impl->pd);
-                        comp_analyzer.squared_gyradius = 0.0;
-                        comp_analyzer.link_component_count = comp_analyzer.impl->pd->LinkComponentCount();
-                        comp_analyzer.unlink_count = comp_analyzer.impl->pd->UnlinkCount();
-                        comp_analyzer.is_prime = true;
-                        comp_analyzer.is_composite = false;
-                        comp_analyzer.prime_component_count = 1;
-
-                        result.prime_components.push_back(std::move(comp_analyzer));
-                    }
-                    break;
-            }
+        if (simplify) {
+            auto args = make_simplify_args(simplify_level);
+            result.impl->pdc.Simplify(args);
         }
 
-        // Extract properties
-        if (result.impl->pd) {
-            result.crossing_count = result.impl->pd->CrossingCount();
-            result.writhe = result.impl->pd->Writhe();
-            result.pd_code = pd_to_string(*result.impl->pd);
-            result.gauss_code = gauss_to_string(*result.impl->pd);
-            result.squared_gyradius = 0.0;  // No coordinates available
-            result.link_component_count = result.impl->pd->LinkComponentCount();
-            result.unlink_count = result.impl->pd->UnlinkCount();
+        // Analyze the complex
+        auto analysis = PDCAnalysis::analyze(result.impl->pdc);
+        result.impl->primary_diagram_idx = analysis.first_nontrivial_idx;
 
-            if (result.prime_components.empty()) {
-                result.is_prime = true;
-                result.is_composite = false;
-                result.prime_component_count = (result.crossing_count > 0) ? 1 : 0;
-            } else {
-                result.is_composite = true;
-                result.is_prime = false;
-                result.prime_component_count = result.prime_components.size();
-                if (result.crossing_count > 0) {
-                    result.prime_component_count++;
-                }
+        // Extract properties
+        result.crossing_count = analysis.total_crossing_count;
+        result.writhe = analysis.total_writhe;
+        result.unlink_count = analysis.unlink_count;
+        result.squared_gyradius = 0.0;  // No coordinates available
+
+        const PD_T* primary = result.impl->get_primary_diagram();
+        if (primary) {
+            result.pd_code = pd_to_string(*primary);
+            result.gauss_code = gauss_to_string(*primary);
+            result.link_component_count = primary->LinkComponentCount();
+        } else {
+            result.pd_code = "";
+            result.gauss_code = "";
+            result.link_component_count = 1;
+        }
+
+        // Prime decomposition
+        if (analysis.nontrivial_count > 1) {
+            result.is_composite = true;
+            result.is_prime = false;
+            result.prime_component_count = analysis.nontrivial_count;
+
+            for (Int i = 0; i < result.impl->pdc.DiagramCount(); ++i) {
+                const PD_T& comp_pd = result.impl->pdc.Diagram(i);
+                if (comp_pd.ProvenUnknotQ() || comp_pd.CrossingCount() == 0) continue;
+
+                KnotAnalyzer comp;
+                comp.impl = std::make_shared<KnotAnalyzerImpl>();
+                PD_T comp_copy = comp_pd;
+                comp.impl->pdc = PDC_T(std::move(comp_copy));
+                comp.impl->primary_diagram_idx = 0;
+                comp.crossing_count = comp_pd.CrossingCount();
+                comp.writhe = comp_pd.Writhe();
+                comp.pd_code = pd_to_string(comp_pd);
+                comp.gauss_code = gauss_to_string(comp_pd);
+                comp.squared_gyradius = 0.0;
+                comp.link_component_count = comp_pd.LinkComponentCount();
+                comp.unlink_count = 0;
+                comp.is_prime = true;
+                comp.is_composite = false;
+                comp.prime_component_count = 1;
+
+                result.prime_components.push_back(std::move(comp));
             }
+        } else if (analysis.nontrivial_count == 1) {
+            result.is_prime = true;
+            result.is_composite = false;
+            result.prime_component_count = 1;
+        } else {
+            result.is_prime = true;
+            result.is_composite = false;
+            result.prime_component_count = 0;
         }
 
     } catch (const std::exception& e) {
