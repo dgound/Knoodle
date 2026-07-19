@@ -16,6 +16,9 @@
 // Face-matrix Alexander: valid for multi-component links.
 #include "src/KnotInvariants/AlexanderFaceMatrix.hpp"
 
+// Prime knot identification from MacLeod codes.
+#include "src/PrimeKnotLookupTable.hpp"
+
 
 // Include our bridge header
 #include "bindings.h"
@@ -859,6 +862,78 @@ link_invariants(
         pd_out.clear();
     }
     return {mat, drop, pd_out};
+}
+
+// Prime knot identification via MacLeod code lookup tables
+class KnotLookupTableImpl {
+public:
+    PrimeKnotLookupTable table;
+
+    KnotLookupTableImpl(const std::string& path, int max_crossings)
+        : table(std::filesystem::path(path), static_cast<Size_T>(max_crossings)) {}
+};
+
+KnotLookupTable::KnotLookupTable(const std::string& path, int max_crossings) {
+    namespace fs = std::filesystem;
+
+    const int limit = std::min(
+        max_crossings, static_cast<int>(PrimeKnotLookupTable::max_c_count));
+
+    // Probe which table files are present so we can load up to the highest
+    // available crossing count and give a clear error when there are none
+    // (the tables are not shipped with pyknoodle).
+    int highest_found = 0;
+    for (int c = 3; c <= limit; ++c) {
+        const std::string s = (c < 10 ? "0" : "") + std::to_string(c);
+        const fs::path k = fs::path(path) / ("Klut_Keys_" + s + ".bin");
+        const fs::path v = fs::path(path) / ("Klut_Values_" + s + ".tsv");
+        if (fs::exists(k) && fs::exists(v)) {
+            highest_found = c;
+        }
+    }
+
+    if (highest_found == 0) {
+        throw std::runtime_error(
+            "KnotLookupTable: no lookup tables (Klut_Keys_NN.bin / "
+            "Klut_Values_NN.tsv, NN = 03..13) found in '" + path + "'. "
+            "The tables are not shipped with pyknoodle. To generate them: "
+            "enumerate 4-valent planar graphs with plantri, sieve the minimal "
+            "diagrams with Knoodle's PlantriSiever, and name the resulting "
+            "classes with SnapPy or Regina; see the 'Knot identification' "
+            "section of python/README.md for details.");
+    }
+
+    impl = std::make_shared<KnotLookupTableImpl>(path, highest_found);
+}
+
+std::string KnotLookupTable::lookup(const std::vector<uint8_t>& macleod_code) const {
+    // One byte per crossing; codes longer than the library maximum cannot be
+    // in any table (and must not reach KeyFromMacLeodCode, whose key buffer
+    // holds only 16 bytes).
+    if (macleod_code.empty() ||
+        macleod_code.size() > PrimeKnotLookupTable::max_c_count) {
+        return "";
+    }
+
+    std::string name = impl->table.LookupName(
+        macleod_code.data(), static_cast<Int>(macleod_code.size()));
+
+    return (name == "NotFound") ? std::string() : name;
+}
+
+std::string KnotLookupTable::lookup(const KnotAnalyzer& analyzer) const {
+    // A fully simplified unknot leaves no primary diagram: at most one trivial
+    // component remains, reported either via link_component_count or via
+    // unlink_count depending on how the complex accounts for it.
+    if (analyzer.crossing_count == 0 &&
+        analyzer.link_component_count + analyzer.unlink_count <= 1) {
+        return "0_1";
+    }
+    return lookup(analyzer.macleod_code());
+}
+
+int KnotLookupTable::max_crossings() const {
+    return static_cast<int>(impl->table.CrossingCount());
 }
 
 // MacLeod code methods
