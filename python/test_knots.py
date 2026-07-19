@@ -248,6 +248,33 @@ def test_invariants():
     print("  PASSED")
 
 
+def test_macleod_cross_class_agreement():
+    """Table generation computes MacLeod codes with the legacy PlanarDiagram
+    (sieve_shadows), while KnotAnalyzer computes them with PlanarDiagram2.
+    Lookups against generated tables only work if the two canonicalizations
+    agree, which nothing in the library enforces -- pin it here."""
+    print("=== MacLeod code agreement: PlanarDiagram vs PlanarDiagram2 ===")
+    for coords, c in [
+        (make_torus_knot_coords(2, 3), 3),
+        (make_figure_eight_coords(), 4),
+    ]:
+        ka = knoodle.KnotAnalyzer(coords, simplify=True, simplify_level=5)
+        assert ka.crossing_count == c
+
+        # The diagram's own shadow: its PD code with over/under stripped.
+        # The sieve enumerates every assignment of that shadow (including the
+        # diagram itself) and records legacy-computed MacLeod codes.
+        shadow = [x for row in ka.get_pd_code_matrix() for x in row[:4]]
+        minimal, other = knoodle.sieve_shadows(
+            shadow, c, rattle_iter=10, thread_count=2)
+        legacy_codes = ({code for code, _ in minimal}
+                        | {code for code, _ in other})
+
+        assert bytes(ka.macleod_code()) in legacy_codes, (
+            "PlanarDiagram2 MacLeod code not among legacy PlanarDiagram codes")
+    print("  PASSED")
+
+
 if __name__ == "__main__":
     test_figure_eight()
     test_5_1()
@@ -256,4 +283,5 @@ if __name__ == "__main__":
     test_batch_alexander()
     test_simplify_levels()
     test_invariants()
+    test_macleod_cross_class_agreement()
     print("\nALL TESTS PASSED!")

@@ -264,8 +264,17 @@ struct PDCAnalysis {
     }
 };
 
-// Bridge: construct an old PlanarDiagram from a new PlanarDiagram2's PD code
-// Needed because Alexander_UMFPACK still uses PlanarDiagram<Int>
+// Bridge: construct an old PlanarDiagram from a new PlanarDiagram2's PD code.
+// Needed because Alexander_UMFPACK still uses PlanarDiagram<Int>.
+//
+// The unlink count is passed as 0 deliberately: a PD code cannot encode
+// trivial split circles (hence the separate constructor argument), and
+// PlanarDiagram2 has no per-diagram unlink counter anyway -- in the complex
+// architecture trivial components are sibling diagrams, counted at analysis
+// level. This bridge is only valid for a single diagram of the complex,
+// interpreted in isolation (which is what the Alexander evaluation of the
+// primary diagram wants); it must not be treated as a conversion of the
+// whole link.
 OldPD_T bridge_to_old_pd(const PD_T& pd2) {
     auto pdcode = pd2.PDCode();
     Int n = pd2.CrossingCount();
